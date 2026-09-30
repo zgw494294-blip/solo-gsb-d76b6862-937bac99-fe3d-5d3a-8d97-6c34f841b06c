@@ -12,16 +12,21 @@
 
 算法
 ----
-正向 / 反向两次布尔可达性 DP，状态与 planner 的成本 DP 相同：
+与最优求解共用同一套状态与转移语义，不另写规则：状态为
 (pos, mask, h)，mask 打包到达 pos 时最近 4 段的水平状态（bit 0 为最近
-一段），不存在的更早段以“水平(1)”填充，使不足 5 段时不误触发约束。
+一段），不存在的更早段以“水平(1)”填充（planner.INITIAL_MASK），使不足
+5 段时不误触发约束；每条候选转移是否合法只由 planner.step_rule 判定，
+相邻高差与 0～200 值域只由 planner.height_bounds 夹取。
 
-- fwd[pos][mask][h]：能否从首点（标高固定为 ground[0]）走到 pos 点取 h；
-- bwd[pos][mask][h]：从 pos 点取 h 出发，能否走到尾点（标高固定为
-  ground[-1]）。
+- fwd[pos][mask][h]：能否从首点（标高固定为 ground[0]）走到 pos 点取 h
+  （前向布尔可达性，本模块计算）；
+- 后向可达性直接复用 planner.backward_cost_dp：
+  dp[pos][mask][h] < INF 当且仅当从 pos 点取 h 出发能合法走到尾点
+  （标高固定为 ground[-1]）。这正是最优求解所用的同一张后向 DP 表。
 
 跨过 pos 的连续 5 段窗口由两侧共享的 mask 校验，因此第 i 点可锁定 h
-当且仅当存在 mask 使 fwd[i][mask][h] 与 bwd[i][mask][h] 同时成立。
+当且仅当存在 mask 使 fwd[i][mask][h] 与 dp[i][mask][h] < INF 同时成立。
+可行性判定与 /api/plan 同源，同一地面数据不可能在两种结果中冲突。
 复杂度 O(n · 2^4 · 201 · (2·8+1))，16 个测点约两百万次基本操作。
 """
 
@@ -32,87 +37,48 @@ from typing import List
 from .planner import (
     H_MAX,
     H_MIN,
-    MAX_GRADE,
+    INF,
     RECENT,
-    WINDOW,
-    _MASK_RECENT,
+    backward_cost_dp,
+    height_bounds,
+    _step_rules,
+    INITIAL_MASK,
     _infeasible_reason,
     _validate,
-    _window_mask,
 )
 
 
 def _forward_reachable(ground: List[int]) -> list:
-    """fwd[pos][mask][h]：前缀 0..pos 可行且 plan[pos] == h。"""
+    """fwd[pos][mask][h]：前缀 0..pos 可行且 plan[pos] == h。
+
+    与最优求解的重建过程走同一套转移（planner 的 step_rule 规则核心
+    ``_step_rules``）：从 INITIAL_MASK、ground[0] 出发，逐段枚举合法
+    下一标高（相邻高差与值域由 height_bounds 夹取）。
+    """
     n = len(ground)
     size = H_MAX + 1
     fwd = [[[False] * size for _ in range(1 << RECENT)] for _ in range(n)]
-    fwd[0][_MASK_RECENT][ground[0]] = True      # 起点之前的虚拟段视为水平
+    fwd[0][INITIAL_MASK][ground[0]] = True
     for pos in range(n - 1):
-        check_window = pos >= WINDOW - 1        # 放下第 pos 段后凑满 5 段窗口
         nxt = fwd[pos + 1]
+        rules = _step_rules(pos)
         for mask in range(1 << RECENT):
+            flat_mask, slope_mask = rules[mask]
             row = fwd[pos][mask]
-            nmask_flat = 1 | ((mask << 1) & _MASK_RECENT)    # 新段水平
-            nmask_slope = (mask << 1) & _MASK_RECENT         # 新段非水平
-            ok_flat = not check_window or _window_mask(mask, 1) != 0
-            ok_slope = not check_window or _window_mask(mask, 0) != 0
-            if not (ok_flat or ok_slope):
+            if flat_mask is None and slope_mask is None:
                 continue
-            row_flat = nxt[nmask_flat]
-            row_slope = nxt[nmask_slope]
             for h in range(H_MIN, H_MAX + 1):
                 if not row[h]:
                     continue
-                if ok_flat:
-                    row_flat[h] = True
-                if ok_slope:
-                    lo = max(H_MIN, h - MAX_GRADE)
-                    hi = min(H_MAX, h + MAX_GRADE)
+                if flat_mask is not None:
+                    nxt[flat_mask][h] = True
+                if slope_mask is not None:
+                    lo, hi = height_bounds(h)
                     for nh in range(lo, h):
-                        row_slope[nh] = True
+                        nxt[slope_mask][nh] = True
                     for nh in range(h + 1, hi + 1):
-                        row_slope[nh] = True
+                        nxt[slope_mask][nh] = True
     return fwd
-
-
-def _backward_reachable(ground: List[int]) -> list:
-    """bwd[pos][mask][h]：plan[pos] == h 时后缀 pos..n-1 可补全。"""
-    n = len(ground)
-    size = H_MAX + 1
-    bwd = [[[False] * size for _ in range(1 << RECENT)] for _ in range(n)]
-    glast = ground[n - 1]
-    for mask in range(1 << RECENT):
-        bwd[n - 1][mask][glast] = True
-    for pos in range(n - 2, -1, -1):
-        check_window = pos >= WINDOW - 1        # 第 pos 段是某窗口的最后一段
-        nxt = bwd[pos + 1]
-        for mask in range(1 << RECENT):
-            nmask_flat = 1 | ((mask << 1) & _MASK_RECENT)
-            nmask_slope = (mask << 1) & _MASK_RECENT
-            ok_flat = not check_window or _window_mask(mask, 1) != 0
-            ok_slope = not check_window or _window_mask(mask, 0) != 0
-            row_flat = nxt[nmask_flat]
-            row_slope = nxt[nmask_slope]
-            cell = bwd[pos][mask]
-            for h in range(H_MIN, H_MAX + 1):
-                ok = False
-                if ok_flat and row_flat[h]:
-                    ok = True
-                elif ok_slope:
-                    lo = max(H_MIN, h - MAX_GRADE)
-                    hi = min(H_MAX, h + MAX_GRADE)
-                    for nh in range(lo, h):
-                        if row_slope[nh]:
-                            ok = True
-                            break
-                    if not ok:
-                        for nh in range(h + 1, hi + 1):
-                            if row_slope[nh]:
-                                ok = True
-                                break
-                cell[h] = ok
-    return bwd
 
 
 def _compress_intervals(values: List[int]) -> List[List[int]]:
@@ -149,16 +115,16 @@ def lockable_analysis(ground: List[int]) -> dict:
     _validate(ground)
     n = len(ground)
     fwd = _forward_reachable(ground)
-    bwd = _backward_reachable(ground)
+    dp = backward_cost_dp(ground)     # 与 /api/plan 同一张后向 DP 表
 
     points = []
     for pos in range(n):
         f_layer = fwd[pos]
-        b_layer = bwd[pos]
+        b_layer = dp[pos]
         values = []
         for h in range(H_MIN, H_MAX + 1):
             for mask in range(1 << RECENT):
-                if f_layer[mask][h] and b_layer[mask][h]:
+                if f_layer[mask][h] and b_layer[mask][h] < INF:
                     values.append(h)
                     break
         points.append({"index": pos + 1, "intervals": _compress_intervals(values)})
